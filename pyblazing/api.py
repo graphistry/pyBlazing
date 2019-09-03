@@ -155,7 +155,8 @@ class PyConnector(metaclass=Singleton):
                                                                                        orcStripe=orc_args.stripe,
                                                                                        orcSkipRows=orc_args.skip_rows,
                                                                                        orcNumRows=orc_args.num_rows,
-                                                                                       orcUseIndex=orc_args.use_index)
+                                                                                       orcUseIndex=orc_args.use_index,
+                                                                                       hasMinmaxMetadata=False)
 
         requestBuffer = blazingdb.protocol.transport.channel.MakeRequestBuffer(OrchestratorMessageType.DDL_CREATE_TABLE,
                                                                                self._accessToken, dmlRequestSchema)
