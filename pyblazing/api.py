@@ -1,36 +1,50 @@
+import time
+import re
+
+from collections import OrderedDict
+
 import cudf as gd
+
+from collections import namedtuple
 
 import blazingdb.protocol
 import blazingdb.protocol.interpreter
 import blazingdb.protocol.orchestrator
 import blazingdb.protocol.transport.channel
+
+from blazingdb.messages.blazingdb.protocol.Status import Status
 from blazingdb.protocol.errors import Error
 from blazingdb.protocol.calcite.errors import SyntaxError
-from blazingdb.messages.blazingdb.protocol.Status import Status
+from blazingdb.protocol.transport.channel import MakeRequestBuffer
+from blazingdb.protocol.transport.channel import ResponseSchema
+from blazingdb.protocol.transport.channel import ResponseErrorSchema
+from blazingdb.protocol.orchestrator import OrchestratorMessageType
+from blazingdb.protocol.io  import FileSystemRegisterRequestSchema, FileSystemDeregisterRequestSchema
+from blazingdb.protocol.io import DriverType, FileSystemType, EncryptionType, FileSchemaType
 
 from blazingdb.protocol.interpreter import InterpreterMessage
-from blazingdb.protocol.orchestrator import OrchestratorMessageType
+from blazingdb.protocol.orchestrator import OrchestratorMessageType, NodeTableSchema
 from blazingdb.protocol.gdf import gdf_columnSchema
+from blazingdb.messages.blazingdb.protocol.gdf.gdf_time_unit import gdf_time_unit
 
 import pyarrow as pa
-from cudf.bindings.cudf_cpp import *
+from cudf._lib.cudf import *
 
-from cudf.dataframe.string import StringColumn
+from cudf.core.dataframe import StringColumn
 from cudf import DataFrame
-from cudf.dataframe.buffer import Buffer
-from cudf.dataframe.columnops import build_column
+from cudf.core.buffer import Buffer
+from cudf.core.column.column import build_column
 from cudf.utils.utils import calc_chunk_size, mask_dtype, mask_bitsize
 
 import numpy as np
 import pandas as pd
 
-import time
 import nvstrings
-from collections import OrderedDict
 
 # NDarray device helper
 from numba import cuda
 from numba.cuda.cudadrv import driver, devices
+
 require_context = devices.require_context
 current_context = devices.get_context
 gpus = devices.gpus
@@ -40,11 +54,261 @@ dataColumnTokens = {}
 validColumnTokens = {}
 
 
+# BEGIN DataSource internal utils
+
+
+# NOTE _CsvArgs() is an internal class for CSV args parsing & validation
+class _CsvArgs():
+
+    def __init__(self, paths, **kwargs):
+        self.paths = paths
+        self.column_names = kwargs.get('names', [])
+        self.column_types = kwargs.get('dtype', [])
+        self.delimiter = kwargs.get('delimiter', None)  # the actual default value will be set in the validation funcion
+        self.skiprows = kwargs.get('skiprows', 0)
+        self.lineterminator = kwargs.get('lineterminator', '\n')
+        self.skipinitialspace = kwargs.get('skipinitialspace', False)
+        self.delim_whitespace = kwargs.get('delim_whitespace', False)
+        self.header = kwargs.get('header', -1)
+        self.nrows = kwargs.get('nrows', None)  # the actual default value will be set in the validation funcion
+        self.skip_blank_lines = kwargs.get('skip_blank_lines', True)
+        self.quotechar = kwargs.get('quotechar', '\"')
+        self.quoting = kwargs.get('quoting', 0)
+        self.doublequote = kwargs.get('doublequote', True)
+        self.decimal = kwargs.get('decimal', '.')
+        self.skipfooter = kwargs.get('skipfooter', 0)
+        self.keep_default_na = kwargs.get('keep_default_na', True)
+        self.na_filter = kwargs.get('na_filter', True)
+        self.dayfirst = kwargs.get('dayfirst', False)
+        self.thousands = kwargs.get('thousands', '\0')
+        self.comment = kwargs.get('comment', '\0')
+        self.true_values = kwargs.get('true_values', [])
+        self.false_values = kwargs.get('false_values', [])
+        self.na_values = kwargs.get('na_values', [])
+
+    # Validate especific params when a csv or psv file is not sent
+    def validate_empty(self):
+        self.delimiter = ','
+        self.nrows = -1
+
+    # Validate input params
+    def validation(self):
+
+        # delimiter
+        if self.delimiter == None:
+            first_path = self.paths[0]
+            if first_path[-4:] == '.csv':
+                self.delimiter = ","
+            elif first_path[-4:] == '.psv':
+                self.delimiter = "|"
+            else:
+                self.delimiter = ","
+
+        # lineterminator
+        if isinstance(self.lineterminator, bool):
+            raise TypeError("object of type 'bool' has no len()")
+        elif isinstance(self.lineterminator, int):
+            raise TypeError("object of type 'int' has no len()")
+        if len(self.lineterminator) > 1:
+            raise ValueError("Only length-1 decimal markers supported")
+
+        # skiprows
+        if self.skiprows == None or self.skiprows < 0:
+            self.skiprows = 0
+        elif isinstance(self.skiprows, str):
+            raise TypeError("an integer is required")
+
+        # header
+        if self.header == -1 and len(self.column_names) == 0:
+            self.header = 0
+        if self.header == None or self.header < -1 :
+            self.header = -1
+        elif isinstance(self.header, str):
+            raise TypeError("header must be integer or list of integers")
+
+        # nrows
+        if self.nrows == None:
+            self.nrows = -1
+        elif self.nrows < 0:
+            raise ValueError("'nrows' must be an integer >= 0")
+
+        # skipinitialspace
+        if self.skipinitialspace == None:
+            raise TypeError("an integer is required")
+        elif self.skipinitialspace == False:
+            self.skipinitialspace = False
+        else:
+            self.skipinitialspace = True
+
+        # delim_whitespace
+        if self.delim_whitespace == None or self.delim_whitespace == False:
+            self.delim_whitespace = False
+        elif isinstance(self.delim_whitespace, str):
+            raise TypeError("an integer is required")
+        else:
+            self.delim_whitespace = True
+
+        # skip_blank_lines
+        if self.skip_blank_lines == None or isinstance(self.skip_blank_lines, str):
+            raise TypeError("an integer is required")
+        if self.skip_blank_lines != False:
+            self.skip_blank_lines = True
+
+        # quotechar
+        if self.quotechar == None:
+            raise TypeError("quotechar must be set if quoting enabled")
+        elif isinstance(self.quotechar, int):
+            raise TypeError("quotechar must be string, not int")
+        elif isinstance(self.quotechar, bool):
+            raise TypeError("quotechar must be string, not bool")
+        elif len(self.quotechar) > 1 :
+            raise TypeError("quotechar must be a 1-character string")
+
+        # quoting
+        if isinstance(self.quoting, int) :
+            if self.quoting < 0 or self.quoting > 3 :
+                raise TypeError("bad 'quoting' value")
+        else:
+            raise TypeError(" 'quoting' must be an integer")
+
+        # doublequote
+        if self.doublequote == None or not isinstance(self.doublequote, int):
+            raise TypeError("an integer is required")
+        elif self.doublequote != False:
+            self.doublequote = True
+
+        # decimal
+        if self.decimal == None:
+            raise TypeError("object of type 'NoneType' has no len()")
+        elif isinstance(self.decimal, bool):
+            raise TypeError("object of type 'bool' has no len()")
+        elif isinstance(self.decimal, int):
+            raise TypeError("object of type 'int' has no len()")
+        if len(self.decimal) > 1:
+            raise ValueError("Only length-1 decimal markers supported")
+
+        # skipfooter
+        if self.skipfooter == True or isinstance(self.skipfooter, str):
+            raise TypeError("skipfooter must be an integer")
+        elif self.skipfooter == False or self.skipfooter == None:
+            self.skipfooter = 0
+        if self.skipfooter < 0:
+            self.skipfooter = 0
+
+        # keep_default_na
+        if self.keep_default_na == False or self.keep_default_na == 0:
+            self.keep_default_na = False
+        else:
+            self.keep_default_na = True
+
+        # na_filter
+        if self.na_filter == False or self.na_filter == 0:
+            self.na_filter = False
+        else:
+            self.na_filter = True
+
+        # dayfirst
+        if self.dayfirst == True or self.dayfirst == 1:
+            self.dayfirst = True
+        else:
+            self.dayfirst = False
+
+        # thousands
+        if self.thousands == None:
+            self.thousands = '\0'
+        elif isinstance(self.thousands, bool):
+            raise TypeError("object of type 'bool' has no len()")
+        elif isinstance(self.thousands, int):
+            raise TypeError("object of type 'int' has no len()")
+        if len(self.thousands) > 1:
+            raise ValueError("Only length-1 decimal markers supported")
+
+        # comment
+        if self.comment == None:
+            self.comment = '\0'
+        elif isinstance(self.comment, bool):
+            raise TypeError("object of type 'bool' has no len()")
+        elif isinstance(self.comment, int):
+            raise TypeError("object of type 'int' has no len()")
+        if len(self.comment) > 1:
+            raise ValueError("Only length-1 decimal markers supported")
+
+        # true_values
+        if isinstance(self.true_values, bool):
+            raise TypeError("'bool' object is not iterable")
+        elif isinstance(self.true_values, int):
+            raise TypeError("'int' object is not iterable")
+        elif self.true_values == None:
+            self.true_values = []
+        elif isinstance(self.true_values, str):
+            self.true_values = self.true_values.split(',')
+
+        # false_values
+        if isinstance(self.false_values, bool):
+            raise TypeError("'bool' object is not iterable")
+        elif isinstance(self.false_values, int):
+            raise TypeError("'int' object is not iterable")
+        elif self.false_values == None:
+            self.false_values = []
+        elif isinstance(self.false_values, str):
+            self.false_values = self.false_values.split(',')
+
+        # na_values
+        if isinstance(self.na_values , int) or isinstance(self.na_values , bool):
+            self.na_values = str(self.na_values).split(',')
+        elif self.na_values == None:
+            self.na_values = []
+
+
+# NOTE _OrcArgs() is an internal class for ORC args parsing & validation
+class _OrcArgs():
+
+    def __init__(self, **kwargs):
+        self.stripe = kwargs.get('stripe', -1)
+        self.skip_rows = kwargs.get('skip_rows', None)  # the actual default value will be set in the validation funcion
+        self.num_rows = kwargs.get('num_rows', None)  # the actual default value will be set in the validation funcion
+        self.use_index = kwargs.get('use_index', False)
+
+    # Validate especific params when a csv or psv file is not sent
+    def validate_empty(self):
+        self.skip_rows = 0
+        self.num_rows = -1
+
+    # Validate input params
+    def validation(self):
+
+        # skip_rows
+        if self.skip_rows == None:
+            self.skip_rows = 0
+        elif self.skip_rows < 0:
+            raise ValueError("'skip_rows' must be an integer >= 0")
+
+        # num_rows
+        if self.num_rows == None:
+            self.num_rows = -1
+        elif self.num_rows < 0:
+            raise ValueError("'num_rows' must be an integer >= 0")
+
+
+def _make_default_orc_arg(**kwargs):
+    orc_args = _OrcArgs(**kwargs)
+    orc_args.validate_empty()
+    return orc_args
+
+
+def _make_default_csv_arg(**kwargs):
+    paths = kwargs.get('path', [])
+    csv_args = _CsvArgs(paths, **kwargs)
+    csv_args.validate_empty()
+    return csv_args
+
+# END DataSource internal utils
+
 # connection_path is a ip/host when tcp and can be unix socket when ipc
-def _send_request(connection_path, connection_port, requestBuffer):
+def _send_request(connection_path, connection_port, requestBuffer, expect_response=True):
     connection = blazingdb.protocol.TcpSocketConnection(connection_path, connection_port)
     client = blazingdb.protocol.Client(connection)
-    return client.send(requestBuffer)
+    return client.send(requestBuffer, expect_response)
 
 class Singleton(type):
     _instances = {}
@@ -59,10 +323,16 @@ class PyConnector(metaclass=Singleton):
         self._orchestrator_path = '127.0.0.1'
         self._orchestrator_port = 8889
         self._accessToken = None
+        self.is_dask = False
 
     def __del__(self):
-        self.close_connection()
-
+        if not self.is_dask:
+            try:
+                self.close_connection()
+            except:
+                pass
+        else:
+            self.is_dask = False
 
     def connect(self, orchestrator_path, orchestrator_port):
         # TODO find a way to print only for debug mode (add verbose arg)
@@ -92,7 +362,6 @@ class PyConnector(metaclass=Singleton):
         responsePayload = blazingdb.protocol.orchestrator.AuthResponseSchema.From(
             response.payload)
 
-        print('connection established')
         self._accessToken = responsePayload.accessToken
 
     def close_connection(self):
@@ -120,7 +389,19 @@ class PyConnector(metaclass=Singleton):
     def is_connected(self):
         return self._accessToken is not None
 
-    def run_ddl_create_table(self, tableName, columnNames, columnTypes, dbName, schemaType, blazing_table, files, resultToken, csv_args, jsonLines, orc_args):
+    def run_ddl_create_table(self,
+                             tableName,
+                             columnNames,
+                             columnTypes,
+                             dbName,
+                             schemaType,
+                             blazing_table,
+                             files,
+                             resultToken,
+                             csv_args,
+                             jsonLines,
+                             orc_args,
+                             daskTables):
 
         dmlRequestSchema = blazingdb.protocol.orchestrator.BuildDDLCreateTableRequestSchema(name=tableName,
                                                                                        dbName=dbName,
@@ -156,7 +437,8 @@ class PyConnector(metaclass=Singleton):
                                                                                        orcSkipRows=orc_args.skip_rows,
                                                                                        orcNumRows=orc_args.num_rows,
                                                                                        orcUseIndex=orc_args.use_index,
-                                                                                       hasMinmaxMetadata=False)
+                                                                                       hasMinmaxMetadata=False,
+                                                                                       daskTables=daskTables)
 
         requestBuffer = blazingdb.protocol.transport.channel.MakeRequestBuffer(OrchestratorMessageType.DDL_CREATE_TABLE,
                                                                                self._accessToken, dmlRequestSchema)
@@ -216,7 +498,22 @@ class PyConnector(metaclass=Singleton):
 
         return response.status
 
+    def run_scan_datasource(self, directory, wildcard):
+        datasourceSchema = blazingdb.protocol.orchestrator.BuildDataSourceRequestSchema(directory = directory, wildcard = wildcard)
 
+        requestBuffer = blazingdb.protocol.transport.channel.MakeRequestBuffer(OrchestratorMessageType.ScanDataSource, self._accessToken, datasourceSchema)
+
+        responseBuffer = _send_request(self._orchestrator_path, self._orchestrator_port, requestBuffer)
+        response = blazingdb.protocol.transport.channel.ResponseSchema.From(responseBuffer)
+
+        if response.status == Status.Error:
+            errorResponse = blazingdb.protocol.transport.channel.ResponseErrorSchema.From(response.payload)
+            raise RuntimeError(errorResponse.errors.decode("utf-8"))
+
+        datasource_response = blazingdb.protocol.orchestrator.DataSourceResponseSchema.From(response.payload)
+        files = list(item.decode("utf-8") for item in datasource_response.files)
+
+        return files
 
 
     def free_result(self, result_token, interpreter_path, interpreter_port):
@@ -262,13 +559,48 @@ class PyConnector(metaclass=Singleton):
 
         return queryResult
 
+    def ping(self):
+        try:
+            response = self.run_system_command("ping", expect_response=True)
+            if (response == "ping"):
+                return True
+            else:
+                return False
+        except Exception as ex:
+            return False
+
+    def call_shutdown(self, process_names):
+        command = 'shutdown'
+        for key in process_names:
+            command = command + " " + key
+
+        self.run_system_command(command, expect_response=False)        
+
+    
+    def run_system_command(self, command, expect_response):
+        systemCommandSchema = blazingdb.protocol.orchestrator.BuildSystemCommandRequestSchema(command = command)
+
+        requestBuffer = blazingdb.protocol.transport.channel.MakeRequestBuffer(OrchestratorMessageType.SystemCommand, self._accessToken, systemCommandSchema)
+        responseBuffer = _send_request(self._orchestrator_path, self._orchestrator_port, requestBuffer, expect_response)
+        if (expect_response):
+            response = blazingdb.protocol.transport.channel.ResponseSchema.From(responseBuffer)
+
+            if response.status == Status.Error:
+                errorResponse = blazingdb.protocol.transport.channel.ResponseErrorSchema.From(response.payload)
+                raise RuntimeError(errorResponse.errors.decode("utf-8"))
+
+            system_command_response = blazingdb.protocol.orchestrator.SystemCommandResponseSchema.From(response.payload)
+            response = system_command_response.response.decode("utf-8")
+            return response
+        
+
 
 def _get_client():
     return PyConnector()
 
 class ResultSetHandle:
 
-    def __init__(self, columns, columnTokens, resultToken, interpreter_path, interpreter_port, handle, client, calciteTime, ralTime, totalTime, error_message, total_nodes, n_crashed_nodes):
+    def __init__(self, columns, columnTokens, resultToken, interpreter_path, interpreter_port, handle, client, calciteTime, ralTime, totalTime, error_message, total_nodes, n_crashed_nodes, is_dask=False):
         self.columns = columns
         self.columnTokens = columnTokens
 
@@ -297,18 +629,25 @@ class ResultSetHandle:
         self.totalTime = totalTime
         self.error_message = error_message
         self.total_nodes =  total_nodes
-        self.n_crashed_nodes = n_crashed_nodes 
+        self.n_crashed_nodes = n_crashed_nodes
+        self.is_dask = is_dask
 
     def __del__(self):
         for key in self._buffer_ids:
             dataColumnTokens.pop(key, None)
             validColumnTokens.pop(key, None)
 
-        if self.handle is not None:
+        # TODO: Create a type (class hierarchy) for result handles of dask_cudf
+        #       and remove `is_dask` member
+        if (self.handle is not None) and (not self.is_dask):
             for ipch in self.handle: #todo add NVStrings handles
                 ipch.close()
             del self.handle
-            self.client.free_result(self.resultToken,self.interpreter_path,self.interpreter_port)
+            try :
+                self.client.free_result(self.resultToken,self.interpreter_path,self.interpreter_port)
+            except:
+                pass
+
 
 
     def __str__(self):
@@ -449,6 +788,15 @@ def get_np_dtype_to_gdf_dtype(dtype):
     }
     return dtypes[dtype]
 
+def get_gdf_timeunit_to_np_dtype(time_unit):
+    time_unit_to_dtype_map = {
+        gdf_time_unit.TIME_UNIT_s: np.dtype('datetime64[s]'),
+        gdf_time_unit.TIME_UNIT_ms: np.dtype('datetime64[ms]'),
+        gdf_time_unit.TIME_UNIT_us: np.dtype('datetime64[us]'),
+        gdf_time_unit.TIME_UNIT_ns: np.dtype('datetime64[ns]')
+    }
+    return time_unit_to_dtype_map[time_unit]
+
 def get_dtype_values(dtypes):
     values = []
     def gdf_type(type_name):
@@ -468,6 +816,7 @@ def get_dtype_values(dtypes):
             'int': gdf_dtype.GDF_INT32,
             'int32': gdf_dtype.GDF_INT32,
             'int64': gdf_dtype.GDF_INT64,
+            'boolean':gdf_dtype.GDF_BOOL8
         }
         if dicc.get(type_name):
             return dicc[type_name]
@@ -583,6 +932,8 @@ def _private_get_result(resultToken, interpreter_path, interpreter_port, calcite
 
         if c.dtype == gdf_dtype.GDF_DATE64:
             np_dtype = np.dtype('datetime64[ms]')
+        elif c.dtype == gdf_dtype.GDF_TIMESTAMP:
+            np_dtype = get_gdf_timeunit_to_np_dtype(c.dtype_info.time_unit)
         else:
             np_dtype = gdf_to_np_dtype(c.dtype)
 
@@ -676,7 +1027,7 @@ def _run_query_get_results(distMetaToken, startTime):
     totalTime = 0
     total_nodes = 1
     n_crashed_nodes = 0
-            
+
     result_list = []
     for result in distMetaToken:
         try:
@@ -684,32 +1035,32 @@ def _run_query_get_results(distMetaToken, startTime):
                                                         result.nodeConnection.path.decode('utf8'),
                                                         result.nodeConnection.port,
                                                         result.calciteTime)
-            
+
             totalTime = (time.time() - startTime) * 1000  # in milliseconds
-            
+
             result_list.append({'result': result, 'resultSet': resultSet, 'ipchandles': ipchandles, 'totalTime':totalTime, 'error_message':''})
-            
+
         except (SyntaxError, RuntimeError, ValueError, ConnectionRefusedError, AttributeError) as error:
             error_message = error
         except Error as error:
             error_message = str(error)
         except Exception as error:
             error_message = "Unexpected error on " + _run_query_get_results.__name__ + ", " + str(error)
-            
+
         if error_message is not '':
             print(error_message)
             result_list.append({'result': result, 'resultSet': None, 'ipchandles': None, 'totalTime':0, 'error_message':error_message})
-                    
-        if error_message is not '':            
+
+        if error_message is not '':
             print(error_message)
-            n_crashed_nodes = n_crashed_nodes + 1 
+            n_crashed_nodes = n_crashed_nodes + 1
 
     result_set_list = []
-    
+
     for result in result_list:
         if result['error_message'] is not '':
             result_set_list.append(ResultSetHandle(None,
-                                                   None, 
+                                                   None,
                                                    result['result'].resultToken,
                                                    result['result'].nodeConnection.path.decode('utf8'),
                                                    result['result'].nodeConnection.port,
@@ -808,7 +1159,7 @@ def _get_result_dask(resultToken, interpreter_path, interpreter_port, calciteTim
     resultSet.columns = gdf
     return resultSet, ipchandles
 
-def convert_result_msg(metaToken,connection):
+def convert_result_msg(metaToken, connection, is_dask=False):
 
     resultSet, ipchandles = _get_result_dask(metaToken[0].resultToken,"127.0.0.1",8891,0,connection)
 
@@ -821,25 +1172,33 @@ def convert_result_msg(metaToken,connection):
                            result['result'].resultToken,
                            result['result'].nodeConnection.path.decode('utf8'),
                            result['result'].nodeConnection.port,
-                                               result['ipchandles'],
-                                               connection,
-                                               result['result'].calciteTime,
-                                               result['resultSet'].metadata.time,
-                                               totalTime,
-                                               ''
-                                               )
+                           result['ipchandles'],
+                           connection,
+                           result['result'].calciteTime,
+                           result['resultSet'].metadata.time,
+                           totalTime,
+                           '',
+                           1,  # TODO: Use connection to get total_nodes
+                           0,  # and n_crashed_nodes
+                           is_dask=is_dask)
 
 
-def convert_to_dask(metaToken,connection):
-    result_set = convert_result_msg(metaToken,connection)
-    return result_set.columns.copy(deep=True)
+def convert_to_dask(metaToken, connection):
+    if metaToken:  # TODO: check why metaToken can equals None (check RAL)
+        connection.is_dask = True  # TODO(gcca, percy): go to pyconnector and rewrite is_dask
+        result_set = convert_result_msg(metaToken, connection, True)
+        gdf = result_set.columns.copy(deep=True)
+        if not hasattr(gdf, '_meta'):
+            setattr(gdf, '_meta', gdf.iloc[:0])
+        return gdf
+
 
 def run_query_get_concat_results(metaToken, startTime):
     return _run_query_get_concat_results(metaToken, startTime)
 
-def _run_query_get_concat_results(distMetaToken, startTime):
 
-    from cudf.multi import concat
+def _run_query_get_concat_results(distMetaToken, startTime):
+    from cudf import concat
 
     client = _get_client()
 
@@ -850,8 +1209,8 @@ def _run_query_get_concat_results(distMetaToken, startTime):
     sum_ral_time = 0
     sum_total_time = 0
     total_nodes = 0
-    n_crashed_nodes = 0 
-    
+    n_crashed_nodes = 0
+
     for result in distMetaToken:
         ral_count = ral_count + 1
         error_message = ''
@@ -863,11 +1222,11 @@ def _run_query_get_concat_results(distMetaToken, startTime):
                                                         result.calciteTime)
 
             totalTime = (time.time() - startTime) * 1000  # in milliseconds
-            
+
             sum_calcite_time = sum_calcite_time + result.calciteTime
             sum_ral_time =  sum_ral_time  + resultSet.metadata.time
             sum_total_time =  sum_total_time + totalTime
-            
+
             result_list.append(resultSet)
         except (SyntaxError, RuntimeError, ValueError, ConnectionRefusedError, AttributeError) as error:
             error_message = error
@@ -875,21 +1234,21 @@ def _run_query_get_concat_results(distMetaToken, startTime):
             error_message = str(error)
         except Exception as error:
             error_message = "Unexpected error on " + _run_query_get_results.__name__ + ", " + str(error)
-    
+
         total_nodes = total_nodes + 1
-        
-        if error_message is not '':            
+
+        if error_message is not '':
             print(error_message)
             all_error_messages = all_error_messages + " Node " + str(ral_count) + ":" + str(error_message)
             n_crashed_nodes = n_crashed_nodes + 1
-            
+
     need_to_concat = sum([len(result.columns) > 0 for result in result_list]) > 1
 
     gdf =  None
-    
-    if (need_to_concat):
+
+    if need_to_concat or total_nodes > 1:
         all_gdfs = [result.columns for result in result_list]
-        gdf =  concat(all_gdfs, ignore_index=True)        
+        gdf =  concat(all_gdfs, ignore_index=True)
     else:
         for result in result_list:  # if we dont need to concatenate, likely we only have one, or only one that has data
             if (len(result.columns) > 0): # this is the one we want to return, but we need to deep copy it first. We only need to deepcopy the non strings.
@@ -913,7 +1272,7 @@ def _run_query_get_concat_results(distMetaToken, startTime):
                                        n_crashed_nodes  #n_crashed_nodes
                                        )
 
-    return resultSetHandle 
+    return resultSetHandle
 
 
 
@@ -928,14 +1287,6 @@ import numpy as np
 import pandas as pd
 import pyblazing
 
-class SchemaFrom:
-    CsvFile = 0
-    ParquetFile = 1
-    Gdf = 2
-    Distributed = 3
-    JsonFile = 4
-    OrcFile = 5
-
 
 #cambiar para success or failed
 def create_table(tableName, **kwargs):
@@ -946,6 +1297,7 @@ def create_table(tableName, **kwargs):
     dbName = 'main'
     schemaType = kwargs.get('type', None)
     gdf = kwargs.get('gdf', None)
+    dask_cudf = kwargs.get('dask_cudf', None)
     files = kwargs.get('path', [])
     resultToken = kwargs.get('resultToken', 0)
     csv_args = kwargs.get('csv_args', None)
@@ -953,12 +1305,18 @@ def create_table(tableName, **kwargs):
     orc_args = kwargs.get('orc_args', None)
 
     if orc_args == None:
-        orc_args = pyblazing.make_default_orc_arg(**kwargs) # create a OrcArgs with default args
+        orc_args = _make_default_orc_arg(**kwargs) # create a OrcArgs with default args
 
     if gdf is None:
         blazing_table = make_empty_BlazingTable()
     else:
         blazing_table = gdf_to_BlazingTable(gdf)
+
+    if dask_cudf is None:
+        dask_tables = []
+    else:
+        dask_client = kwargs['dask_client']
+        dask_tables = dask_cudf_to_BlazingDaskTable(dask_cudf, dask_client)
 
     if (len(columnTypes) > 0):
         columnTypes = gdf_dtypes_to_gdf_dtype_strs(columnTypes)
@@ -968,12 +1326,22 @@ def create_table(tableName, **kwargs):
             columnTypes = gdf_dtypes_to_gdf_dtype_strs(get_dtype_values(csv_args.column_types))
         columnNames=csv_args.column_names
     else:
-        csv_args = pyblazing.make_default_csv_arg(**kwargs)
+        csv_args = _make_default_csv_arg(**kwargs)
 
     try:
         client = _get_client()
-        return_result = client.run_ddl_create_table(tableName,columnNames,columnTypes,
-                        dbName,schemaType,blazing_table,files,resultToken,csv_args,jsonLines,orc_args)
+        return_result = client.run_ddl_create_table(tableName,
+                                                    columnNames,
+                                                    columnTypes,
+                                                    dbName,
+                                                    schemaType,
+                                                    blazing_table,
+                                                    files,
+                                                    resultToken,
+                                                    csv_args,
+                                                    jsonLines,
+                                                    orc_args,
+                                                    dask_tables)
 
     except (SyntaxError, RuntimeError, ValueError, ConnectionRefusedError, AttributeError) as error:
         error_message = error
@@ -990,6 +1358,64 @@ def create_table(tableName, **kwargs):
     return return_result
 
 
+def get_machine_and_blazing_table(partition):
+    return socket.gethostname(), gdf_to_BlazingTable(gdf)
+
+
+def columnSchemaFrom(dask_column):
+    from blazingdb.protocol.gdf import (cudaIpcMemHandle_tSchema,
+                                        gdf_dtype_extra_infoSchema,
+                                        custringsData_tSchema,
+                                        gdf_columnSchema)
+
+    raw_data = dask_column['data']
+    data = cudaIpcMemHandle_tSchema(reserved=raw_data if raw_data else b'')
+
+    raw_valid = dask_column['valid']
+    valid = cudaIpcMemHandle_tSchema(reserved=raw_valid if raw_valid else b'')
+
+    raw_custrings_data = (dask_column['custrings_data']
+                          if 'custrings_data' in dask_column
+                          else None)
+    custrings_data = custringsData_tSchema(
+        reserved=raw_custrings_data if raw_custrings_data else b'')
+
+    dtype_info = gdf_dtype_extra_infoSchema(time_unit=0)
+
+    return gdf_columnSchema(data=data,
+                            valid=valid,
+                            size=dask_column['size'],
+                            dtype=dask_column['dtype'],
+                            dtype_info=dtype_info,
+                            null_count=dask_column['null_count'],
+                            custrings_data=custrings_data)
+
+
+def tableSchemaFrom(dask_cudf):
+    from blazingdb.protocol.orchestrator import BlazingTableSchema
+    return BlazingTableSchema(columns=[columnSchemaFrom(dask_column)
+                                       for dask_column in dask_cudf['columns']],
+                              columnTokens=dask_cudf['columnTokens'],
+                              resultToken=dask_cudf['resultToken'])
+
+
+def dask_cudf_to_BlazingDaskTable(dask_cudf, dask_client):
+    persisted_cudf = dask_cudf
+
+    distributedBlazingTables = persisted_cudf.map_partitions(
+        gdf_to_BlazingTable).compute()
+
+    who_has = dask_client.who_has()
+    ips = [re.findall(r'(?:\d+\.){3}\d+', who_has[str(k)][0])[0]
+           for k in dask_cudf.dask.keys()]
+
+    dask_cudf_ret = [NodeTableSchema(ip=p[0], gdf=tableSchemaFrom(p[1]))
+                     for p in zip(ips, distributedBlazingTables)]
+
+    return dask_cudf_ret
+
+
+
 def register_file_system(authority, type, root, params = None):
     if params is not None:
         params = namedtuple("FileSystemConnection", params.keys())(*params.values())
@@ -1004,6 +1430,7 @@ def register_file_system(authority, type, root, params = None):
         raise RuntimeError(ResponseErrorSchema.From(response.payload).errors)
     return response.status
 
+
 def deregister_file_system(authority):
     schema = FileSystemDeregisterRequestSchema(authority)
     client = _get_client()
@@ -1015,6 +1442,7 @@ def deregister_file_system(authority):
     if response.status == Status.Error:
         raise RuntimeError(ResponseErrorSchema.From(response.payload).errors)
     return response.status
+
 
 def _create_dummy_table_group():
     database_name = 'main'
@@ -1042,3 +1470,24 @@ def gdf_to_np_dtype(dtype):
     return np.dtype(gdf_dtypes[dtype])
 
 
+
+def scan_datasource(directory, wildcard):
+    return_result = None
+    error_message = ''
+    files = None
+
+    try:
+        client = _get_client()
+        files = client.run_scan_datasource(directory, wildcard)
+
+    except (SyntaxError, RuntimeError, ValueError, ConnectionRefusedError, AttributeError) as error:
+        error_message = error
+    except Error as error:
+        error_message = str(error)
+    except Exception as error:
+        error_message = "Unexpected error on " + scan_datasource.__name__ + ", " + str(error)
+
+    if error_message is not '':
+        raise RuntimeError(error_message)
+
+    return files
